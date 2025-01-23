@@ -1,0 +1,300 @@
+---
+title: "MLB Season 23 xwOBA Modeling Attempts"
+output:
+  html_document:
+    df_print: paged
+classoption: landscape
+---
+
+```{r setup, include=FALSE, echo = FALSE}
+library(tidyverse)
+library(knitr)
+library(caret) # for KNN
+# library(mgcv) # for GAM (maybe not)
+library(dplyr) # for df stuff
+library(baseballr) # for statcast queries
+library(VGAM) # for GAM
+library(ggplot2)
+```
+
+```{r, include = FALSE}
+# Read the Data
+mlb_reg_21 <- read.csv(file = 'mlb_reg_21.csv')
+mlb_reg_22 <- read.csv(file = 'mlb_reg_22.csv')
+mlb_reg_23 <- read.csv(file = 'mlb_reg_23.csv')
+
+# Download sprint speed - two birds with one stone get batter names + speed for model
+speed_21 <- statcast_leaderboards(leaderboard = "sprint_speed", year = 2021)
+speed_21 <- speed_21 %>%
+  rename(batter_name = `last_name, first_name`,
+         batter = player_id) %>%
+  select(batter_name, batter, sprint_speed)
+
+mlb_reg_21$game_date <- as.Date(mlb_reg_21$game_date)
+mlb_reg_21 <- merge(mlb_reg_21, speed_21)
+
+speed_22 <- statcast_leaderboards(leaderboard = "sprint_speed", year = 2022)
+speed_22 <- speed_22 %>%
+  rename(batter_name = `last_name, first_name`,
+         batter = player_id) %>%
+  select(batter_name, batter, sprint_speed)
+
+mlb_reg_22$game_date <- as.Date(mlb_reg_22$game_date)
+mlb_reg_22 <- merge(mlb_reg_22, speed_22)
+
+speed_23 <- statcast_leaderboards(leaderboard = "sprint_speed", year = 2023)
+speed_23 <- speed_23 %>% 
+  rename(batter_name = `last_name, first_name`,
+         batter = player_id) %>% 
+  select(batter_name, batter, sprint_speed)
+
+mlb_reg_23$game_date <- as.Date(mlb_reg_23$game_date)
+mlb_reg_23 <- merge(mlb_reg_23, speed_23)
+```
+
+```{r}
+mlb_reg_2122 <- rbind(mlb_reg_21, mlb_reg_22)
+```
+
+
+I am using the following resource to base my calculations on: https://technology.mlblogs.com/an-introduction-to-expected-weighted-on-base-average-xwoba-29d6070ba52b
+
+# Overview
+
+xwOBA is a derived statistic that comes from the following formula:
+
+$$xwOBA = (xwOBAcon + wBB \times (BB-IBB) + wHBP \times HBP)/(AB + BB - IBB + SF + HBP)$$
+
+Here, $xwOBAcon$ is itself a modeled statistic for $xwOBA$ on contact only, and $wSTAT$ indicates the $wOBA$ weight.
+
+# xwOBAcon
+
+We should try a model based on the following variables: exit velocity (EV), launch angle (LA), and sprint speed.
+
+"Our newest model is a combination of k-NN and GAMs. We use GAMs to model most weakly hit balls, shallow infield pop-ups, and grounders, the idea being that these are balls where speed matters. We apply our existing k-NN model to the remaining liners and fly balls (where the batter’s speed has far less impact on the outcome), only using EV and LA to estimate wOBA."
+
+```{r}
+rm(mlb_reg_21, mlb_reg_22, speed_21, speed_22, speed_23)
+```
+
+
+## First thing is first: Data filtering and Exploratory Analysis
+
+TBH may switch up sources here: https://medium.com/@thomasjamesnestico/modelling-xwoba-with-knn-9b004e93861a
+
+```{r}
+# Filter just contact events
+# Do we include shit like fielders choice etc
+mlb_con_2122 <- mlb_reg_2122 %>% select("events", "launch_speed", "launch_angle", "sprint_speed", "hit_distance_sc", "bb_type", "batter_name", "game_date") %>% filter(events %in% c("field_out", "field_error", "double_play", "grounded_into_double_play", "single", "double", "triple", "home_run", "sac_fly", "sac_fly_double_play"))
+# Turn all random ish into field out
+mlb_con_2122$events <- ifelse(mlb_con_2122$events %in% c("single", "double", "triple", "home_run"), mlb_con_2122$events, "field_out")
+# mlb_con$events <- ifelse(mlb_con$events == "field_out", 0, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "single", 1, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "double", 2, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "triple", 3, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "home_run", 4, mlb_con$events)
+mlb_con_2122$events <- as.factor(mlb_con_2122$events)
+
+mlb_con_2122 <- mlb_con_2122 %>% filter(!is.na(launch_speed)) %>% filter(!is.na(launch_angle))
+
+mlb_con_23 <- mlb_reg_23 %>% select("events", "launch_speed", "launch_angle", "sprint_speed", "hit_distance_sc", "bb_type", "batter_name", "game_date") %>% filter(events %in% c("field_out", "field_error", "double_play", "grounded_into_double_play", "single", "double", "triple", "home_run", "sac_fly", "sac_fly_double_play"))
+# Turn all random ish into field out
+mlb_con_23$events <- ifelse(mlb_con_23$events %in% c("single", "double", "triple", "home_run"), mlb_con_23$events, "field_out")
+# mlb_con$events <- ifelse(mlb_con$events == "field_out", 0, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "single", 1, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "double", 2, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "triple", 3, mlb_con$events)
+# mlb_con$events <- ifelse(mlb_con$events == "home_run", 4, mlb_con$events)
+mlb_con_23$events <- as.factor(mlb_con_23$events)
+
+mlb_con_23 <- mlb_con_23 %>% filter(!is.na(launch_speed)) %>% filter(!is.na(launch_angle))
+```
+
+```{r}
+# Exploratory Plots
+# ggplot(data = mlb_con) +
+#   geom_point(aes(x = launch_speed, y = launch_angle, color = events))
+```
+
+```{r}
+# Need to now separate out Sprint Speed influenced BBE, and non sprint speed (GAM and KNN)
+mlb_soft_con_2122 <- mlb_con_2122 %>% filter((launch_speed < 75)& (launch_angle < 60)&(hit_distance_sc < 120))
+mlb_hard_con_2122 <- mlb_con_2122 %>% anti_join(mlb_soft_con_2122)
+
+mlb_soft_con_23 <- mlb_con_23 %>% filter((launch_speed < 75)& (launch_angle < 60)&(hit_distance_sc < 120))
+mlb_hard_con_23 <- mlb_con_23 %>% anti_join(mlb_soft_con_23)
+```
+
+## Split into testing/training
+
+```{r}
+# # Split into test and train as well as some knn setup
+# 21-22 train, 23 test
+
+# Run algorithms using 10-fold cross validation
+trainControl <- trainControl(method="repeatedcv", number=10, repeats=3)
+metric <- "Accuracy"
+```
+
+## KNN Model for hard hit (relatively) BBE
+
+```{r}
+set.seed(7)
+fit.knn <- train(events~launch_speed+launch_angle, data=mlb_hard_con_2122, method="knn",
+                 metric=metric ,trControl=trainControl)
+knn.k1 <- fit.knn$bestTune # keep this Initial k for testing with knn() function in next section
+print(fit.knn)
+```
+
+```{r}
+plot(fit.knn)
+```
+
+```{r}
+set.seed(7)
+prediction <- predict(fit.knn, newdata = mlb_hard_con_23)
+cf <- confusionMatrix(prediction, as.factor(mlb_hard_con_23$events))
+print(cf)
+```
+
+## From KNN to useful stuff:
+
+Must turn these predicted class probs into a digestible number, our $xwOBAcon$. To do so, lets take the predicted class probabilites, and find the sum
+
+```{r}
+predicted_probs_knn <- predict(fit.knn, newdata = mlb_hard_con_23, type = "prob")
+```
+
+
+```{r}
+single_factor <- 0.855
+double_factor <- 1.248
+triple_factor <- 1.575
+hr_factor <- 2.014
+
+predicted_probs_knn$field_out <- 0
+predicted_probs_knn$single <- predicted_probs_knn$single * single_factor
+predicted_probs_knn$double <- predicted_probs_knn$double * double_factor
+predicted_probs_knn$triple <- predicted_probs_knn$triple * triple_factor
+predicted_probs_knn$home_run <- predicted_probs_knn$home_run * hr_factor
+
+xwOBAcon_vec_knn <- rowSums(predicted_probs_knn)
+```
+
+```{r}
+# Add to original df for grouping
+mlb_hard_con_23$xwOBAcon_knn <- xwOBAcon_vec_knn
+xwOBAcon_player_knn <- mlb_hard_con_23 %>% group_by(batter_name) %>% dplyr::summarize(xwOBAcon_sum_knn = sum(xwOBAcon_knn))
+```
+
+## Now repeat the process but for the GAM with sprint speed
+
+```{r}
+# Linear sprint term, cubic spline LA and EV ? is this justified
+# Fit a multinomial GAM
+gam_multinomial <- vglm(events ~ sprint_speed + s(launch_angle, bs = "cs") + s(launch_speed, bs = "cs"), family = multinomial(), data = mlb_soft_con_2122, trace = TRUE)
+
+# Check the summary
+summary(gam_multinomial)
+```
+
+```{r}
+predicted_probs_gam <- predict(gam_multinomial, newdata = mlb_soft_con_23, type = "response")
+home_run <- 1 - rowSums(predicted_probs_gam)
+predicted_probs_gam <- as.data.frame(cbind(predicted_probs_gam, home_run))
+
+predicted_probs_gam$field_out <- 0
+predicted_probs_gam$single <- predicted_probs_gam$single * single_factor
+predicted_probs_gam$double <- predicted_probs_gam$double * double_factor
+predicted_probs_gam$triple <- predicted_probs_gam$triple * triple_factor
+predicted_probs_gam$home_run <- predicted_probs_gam$home_run * hr_factor
+
+xwOBAcon_vec_gam <- rowSums(predicted_probs_gam)
+```
+
+```{r}
+# Add to original df for grouping
+mlb_soft_con_23$xwOBAcon_gam <- xwOBAcon_vec_gam
+xwOBAcon_player_gam <- mlb_soft_con_23 %>% group_by(batter_name) %>% dplyr::summarize(xwOBAcon_sum_gam = sum(xwOBAcon_gam))
+```
+
+## More data preparation: Find number of AB's, BB's, etc per player
+
+```{r}
+# player_summary <- mlb_reg_23 %>% 
+#   group_by(batter_name) %>% 
+#   dplyr::summarize(HBP = sum(events == "hit_by_pitch", na.rm = TRUE), 
+#                    #uBB = sum(events %in% c(), na.rm = TRUE),
+#                    #IBB = sum(events %in% c(), na.rm = TRUE),
+#                    SF = sum(events %in% c("sac_fly", "sac_bunt"), na.rm = TRUE),
+#                    BB = sum(events == "walk"),
+#                    AB = sum(events %in% c("double", "double_play", "field_error",
+#                                           "field_out", "fielders_choice",
+#                                           "fielders_choice_out", "force_out",
+#                                           "grounded_into_double_play", "home_run",
+#                                           "single","strikeout", "strikeout_double_play",
+#                                           "triple"), na.rm = TRUE))
+player_summary <- read.csv(file="player_summary_23.csv")
+player_summary <- player_summary %>% 
+  rename(batter_name = last_name..first_name,
+         batter = player_id)
+```
+
+```{r}
+final_df <- merge(xwOBAcon_player_knn, player_summary, on='batter_name')
+final_df <- merge(xwOBAcon_player_gam, final_df, on='batter_name')
+final_df$xwOBA <- (0.697*(final_df$walk - final_df$b_intent_walk) + 0.727*final_df$b_hit_by_pitch + final_df$xwOBAcon_sum_knn + final_df$xwOBAcon_sum_gam)/(final_df$ab + final_df$b_sac_fly + final_df$walk - final_df$b_intent_walk + final_df$b_hit_by_pitch)
+final_df <- final_df %>% filter(ab > 100)
+```
+
+```{r}
+final_df
+```
+
+
+```{r}
+wOBA <- statcast_leaderboards(leaderboard = "expected_statistics", year = 2023, min_pa = 1)
+wOBA <- wOBA %>% 
+  rename(batter_name = `last_name, first_name`,
+         batter = player_id) %>% 
+  select(batter_name, batter, woba, est_woba)
+```
+
+```{r}
+overall <- merge(final_df, wOBA, on='batter_name')
+
+# vs regular woba
+ggplot() +
+  geom_point(data = overall, aes(x = woba, y = xwOBA)) +
+  geom_segment(aes(x = 0.1, y = 0.1, xend = 0.5, yend = 0.5))
+
+# vs statcast xwoba
+ggplot() +
+  geom_point(data = overall, aes(x = est_woba, y = xwOBA)) +
+  geom_segment(aes(x = 0.1, y = 0.1, xend = 0.5, yend = 0.5))
+```
+
+```{r}
+overall$xwoba_diff <- overall$xwOBA - overall$est_woba
+
+val_mod <- lm(overall$est_woba ~ overall$xwOBA + 0)
+summary(val_mod)
+```
+
+
+```{r}
+# need a way to manually scrape
+# custom_leaderboards <- statcast_leaderboards(leaderboard = "custom_leaderboards", year = 2023, min_pa = 1)
+```
+
+```{r}
+saveRDS(fit.knn, file="KNN-xwOBA_(hard_hit).rda")
+saveRDS(gam_multinomial, file="GAM-xwOBA_(soft_hit).rda")
+```
+
+
+
+
+
+
+* Thinking emoji * https://www.reddit.com/r/baseball/comments/15veyzp/baseballs_unseen_bias_how_woba_xwoba_xera_and_wrc/
